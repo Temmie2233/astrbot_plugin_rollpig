@@ -3,14 +3,17 @@ import datetime
 import json
 import random
 import tempfile
+import urllib.parse
 from pathlib import Path
 
+import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import At
+from astrbot.core.utils.io import download_image_by_url
 
 # 修复导入冲突：PIL的Image重命名为PILImage
 from PIL import Image as PILImage
@@ -55,6 +58,7 @@ class RollPigPlugin(Star):
         if not self.pig_list:
             logger.error("小猪信息为空或不存在，请检查资源文件！")
         self.today_path = self.plugin_data_dir / "rollpig_today.json"
+        self.remote_pig_api = "https://pighub.top/api/images?limit=10000&sort=latest"
 
         # 初始化字体（优先插件内自定义字体，跨平台兼容）
         self.font_regular = self._init_regular_font()  # 常规字体（描述/解析）
@@ -187,6 +191,74 @@ class RollPigPlugin(Star):
                 logger.debug(f"找到的小猪图片文件：{file.absolute()}")
                 return file
         logger.warning(f"未找到小猪ID {pig_id} 对应的图片文件")
+        return None
+
+    def _build_remote_image_url(self, thumbnail: str) -> str | None:
+        """构建远程猪图 URL"""
+        thumbnail = str(thumbnail or "").strip()
+        if not thumbnail:
+            return None
+
+        if thumbnail.startswith(("http://", "https://")):
+            raw_url = thumbnail
+        else:
+            raw_url = urllib.parse.urljoin("https://pighub.top/", thumbnail.lstrip("/"))
+
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return None
+            encoded_path = "/".join(
+                urllib.parse.quote(seg) for seg in parsed.path.split("/")
+            )
+            return urllib.parse.urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    encoded_path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"构建远程猪图 URL 失败：{e}")
+            return None
+
+    async def fetch_random_remote_pig_image(self) -> str | None:
+        """远程获取一张随机猪图并下载到临时文件"""
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(self.remote_pig_api) as response:
+                    if response.status != 200:
+                        logger.error(f"远程猪图列表请求失败，状态码：{response.status}")
+                        return None
+                    data = await response.json()
+        except Exception as e:
+            logger.error(f"拉取远程猪图列表失败：{e}")
+            return None
+
+        images = data.get("images", []) if isinstance(data, dict) else []
+        if not isinstance(images, list) or not images:
+            logger.warning("远程猪图列表为空")
+            return None
+
+        candidates = images.copy()
+        random.shuffle(candidates)
+        for item in candidates[: min(len(candidates), 5)]:
+            if not isinstance(item, dict):
+                continue
+            image_url = self._build_remote_image_url(item.get("thumbnail", ""))
+            if not image_url:
+                continue
+            try:
+                return await download_image_by_url(image_url)
+            except Exception as e:
+                logger.warning(f"下载远程猪图失败：{e}")
+                continue
+
+        logger.error("远程猪图下载全部失败")
         return None
 
     def render_pig_image(self, pig_data: dict) -> Path | None:
@@ -349,9 +421,24 @@ class RollPigPlugin(Star):
             if (isinstance(seg, At) and str(seg.qq) != event.get_self_id())  # 排除自己
         ]
 
-    @filter.command("今日小猪", alias={"抽小猪", "我的小猪", "rollpig"})
+    @filter.regex(r"^\s*(今日\s*小猪|我的\s*小猪|抽\s*小猪|rollpig)\s*$")
     async def roll_pig(self, event: AstrMessageEvent):
         """抽取今日小猪"""
+        pig = await self.get_today_pig(event)
+        if pig is None:
+            return
+        await self.send_rendered_pig(event, pig, event.get_sender_id())
+
+    @filter.regex(r"^\s*(傲娇\s*猪|傲娇|猪)\s*$")
+    async def send_tsundere_pig(self, event: AstrMessageEvent):
+        """远程随机发送猪图"""
+        raw_message = "".join((event.message_str or "").split())
+        if raw_message in {"傲娇猪", "傲娇"}:
+            await event.send(event.plain_result("傲娇猪🐷"))
+        await self.send_remote_random_pig_image(event)
+
+    async def get_today_pig(self, event: AstrMessageEvent) -> dict | None:
+        """获取用户今日对应的小猪"""
         today_str = datetime.date.today().isoformat()
         user_id = event.get_sender_id()
         if self.at_view_pig:
@@ -359,32 +446,49 @@ class RollPigPlugin(Star):
             at_ids = self.get_at_ids(event)
             if len(at_ids) > 1:
                 await event.send(event.plain_result("一次只能抽取一个小猪哦！"))
-                return
-            if len(parts) >= 2:
+                return None
+            if len(parts) >= 2 and at_ids:
                 if at_ids[0] not in self.admins_id:
                     user_id = at_ids[0]
                 else:
                     await event.send(event.plain_result("你这只小猪，不许对主人不敬！"))
-                    return
+                    return None
         today_cache = self.load_json(self.today_path, {"date": "", "records": {}})
         if today_cache.get("date") != today_str:
             today_cache = {"date": today_str, "records": {}}
         user_records = today_cache["records"]
 
         if user_id in user_records:
-            pig = user_records[user_id]
-            await self.send_rendered_pig(event, pig, user_id)
-            return
+            return user_records[user_id]
 
         if not self.pig_list:
             await event.send(event.plain_result("小猪信息加载失败，请检查后台报错！"))
-            return
+            return None
 
         pig = random.choice(self.pig_list)
         user_records[user_id] = pig
         self.save_json(self.today_path, today_cache)
+        return pig
 
-        await self.send_rendered_pig(event, pig, user_id)
+    async def send_remote_random_pig_image(self, event: AstrMessageEvent):
+        """远程随机发送猪图"""
+        img_path_str = await self.fetch_random_remote_pig_image()
+        if not img_path_str:
+            await event.send(event.plain_result("远程猪图获取失败，请稍后重试～"))
+            return
+
+        img_path = Path(img_path_str)
+        try:
+            await event.send(event.image_result(str(img_path.absolute())))
+            logger.info("远程随机猪图发送成功")
+        except Exception as e:
+            logger.error(f"发送远程随机猪图失败：{e}")
+            await event.send(event.plain_result("远程猪图发送失败，请稍后重试～"))
+        finally:
+            try:
+                img_path.unlink(missing_ok=True)
+            except Exception as cleanup_err:
+                logger.warning(f"清理远程猪图临时文件失败：{cleanup_err}")
 
     async def send_rendered_pig(
         self, event: AstrMessageEvent, pig_data: dict, user_id: str
@@ -404,6 +508,24 @@ class RollPigPlugin(Star):
                 return
             except Exception as e:
                 logger.error(f"发送合成图片失败：{str(e)}")
+            finally:
+                try:
+                    img_path.unlink(missing_ok=True)
+                except Exception as cleanup_err:
+                    logger.warning(f"清理临时图片失败：{cleanup_err}")
+
+        await self.send_fallback_msg(event, pig_data)
+
+    async def send_pig_only_image(self, event: AstrMessageEvent, pig_data: dict):
+        """仅发送小猪图片"""
+        img_path = await asyncio.to_thread(self.render_pig_image, pig_data)
+        if img_path and img_path.exists():
+            try:
+                await event.send(event.image_result(str(img_path.absolute())))
+                logger.info("小猪图片发送成功")
+                return
+            except Exception as e:
+                logger.error(f"发送小猪图片失败：{str(e)}")
             finally:
                 try:
                     img_path.unlink(missing_ok=True)
