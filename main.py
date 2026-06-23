@@ -19,10 +19,6 @@ from astrbot.core.utils.io import download_image_by_url
 from PIL import Image as PILImage
 from PIL import ImageDraw, ImageFont
 
-import os
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:7897"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7897"
-
 
 class RollPigPlugin(Star):
     CANVAS_WIDTH = 800  # 画布宽度
