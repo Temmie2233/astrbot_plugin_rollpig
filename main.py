@@ -19,6 +19,10 @@ from astrbot.core.utils.io import download_image_by_url
 from PIL import Image as PILImage
 from PIL import ImageDraw, ImageFont
 
+import os
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:7897"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7897"
+
 
 class RollPigPlugin(Star):
     CANVAS_WIDTH = 800  # 画布宽度
@@ -58,7 +62,7 @@ class RollPigPlugin(Star):
         if not self.pig_list:
             logger.error("小猪信息为空或不存在，请检查资源文件！")
         self.today_path = self.plugin_data_dir / "rollpig_today.json"
-        self.remote_pig_api = "https://pighub.top/api/images?limit=10000&sort=latest"
+        self.remote_pig_api = "https://pighub.top/api/images?limit=10000&sort=2"
 
         # 初始化字体（优先插件内自定义字体，跨平台兼容）
         self.font_regular = self._init_regular_font()  # 常规字体（描述/解析）
@@ -239,7 +243,8 @@ class RollPigPlugin(Star):
             logger.error(f"拉取远程猪图列表失败：{e}")
             return None
 
-        images = data.get("images", []) if isinstance(data, dict) else []
+        # 【修改点 1】接口返回的图片列表在外层 "data" 键中，而不是 "images"
+        images = data.get("data", []) if isinstance(data, dict) else []
         if not isinstance(images, list) or not images:
             logger.warning("远程猪图列表为空")
             return None
@@ -249,7 +254,8 @@ class RollPigPlugin(Star):
         for item in candidates[: min(len(candidates), 5)]:
             if not isinstance(item, dict):
                 continue
-            image_url = self._build_remote_image_url(item.get("thumbnail", ""))
+            # 【修改点 2】接口单项中的图片路径字段是 "image_url"，而不是 "thumbnail"
+            image_url = self._build_remote_image_url(item.get("image_url", ""))
             if not image_url:
                 continue
             try:
